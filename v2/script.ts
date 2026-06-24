@@ -5,6 +5,7 @@ interface Bag {
     color: string;
     x?: number;
     el?: HTMLElement;
+    visible?: boolean;
 }
 
 const DESTS = ['DXB', 'JFK', 'LHR', 'SIN', 'NRT', 'CDG', 'LAX', 'ICN'];
@@ -25,24 +26,50 @@ const track = document.getElementById('track') as HTMLElement;
 const bags: Bag[] = [];
 let lastSpawn = 0;
 
+// Virtual scrolling: only render bags within viewport + buffer
+const RENDER_BUFFER = 100; // pixels
+
+function createBagElement(bag: Bag): HTMLElement {
+    const el = document.createElement('div');
+    el.className = 'bag';
+    el.style.background = bag.color;
+    el.style.left = (bag.x || 0) + 'px';
+    el.innerHTML = bag.tag + '<br>' + bag.dest + '<br>' + bag.kg;
+    el.addEventListener('mousedown', function (e) { grab(e as MouseEvent, bag, el); });
+    el.addEventListener('touchstart', function (e) { grab(e as TouchEvent, bag, el); }, { passive: false } as AddEventListenerOptions);
+    return el;
+}
+
 function spawn(now: number) {
     if (now - lastSpawn < 2200) return;
     lastSpawn = now;
 
     const bag = makeBag();
     bag.x = (track.parentElement as HTMLElement).clientWidth + 10;
+    bag.visible = false;
 
-    const el = document.createElement('div');
-    el.className = 'bag';
-    el.style.background = bag.color;
-    el.style.left = bag.x + 'px';
-    el.innerHTML = bag.tag + '<br>' + bag.dest + '<br>' + bag.kg;
-    el.addEventListener('mousedown', function (e) { grab(e as MouseEvent, bag, el); });
-    el.addEventListener('touchstart', function (e) { grab(e as TouchEvent, bag, el); }, { passive: false } as AddEventListenerOptions);
-
-    track.appendChild(el);
-    bag.el = el;
     bags.push(bag);
+}
+
+function updateVisibility() {
+    const viewportWidth = (track.parentElement as HTMLElement).clientWidth;
+
+    for (let i = 0; i < bags.length; i++) {
+        const bag = bags[i];
+        const isVisible = (bag.x || 0) < viewportWidth + RENDER_BUFFER && (bag.x || 0) > -100;
+
+        if (isVisible && !bag.visible) {
+            // Bag entered viewport - create element
+            bag.el = createBagElement(bag);
+            track.appendChild(bag.el);
+            bag.visible = true;
+        } else if (!isVisible && bag.visible) {
+            // Bag left viewport - remove element
+            bag.el?.remove();
+            bag.el = undefined;
+            bag.visible = false;
+        }
+    }
 }
 
 function move() {
@@ -54,7 +81,7 @@ function move() {
 
 function despawn() {
     for (let i = bags.length - 1; i >= 0; i--) {
-        if ((bags[i].x || 0) < -70) {
+        if ((bags[i].x || 0) < -100) {
             bags[i].el?.remove();
             bags.splice(i, 1);
         }
@@ -64,6 +91,7 @@ function despawn() {
 function tick(now: number) {
     spawn(now);
     move();
+    updateVisibility();
     despawn();
     requestAnimationFrame(tick);
 }
@@ -140,18 +168,36 @@ document.getElementById('unload')!.addEventListener('click', function () {
 });
 
 const ghost = document.getElementById('ghost') as HTMLElement;
-let drag: { bag: Bag; el: HTMLElement } | null = null;
+let drag: { bag: Bag; el: HTMLElement; startX: number; startY: number; startTime: number } | null = null;
+
+// Haptic feedback helper
+function vibrate(pattern: number | number[]) {
+    if ('vibrate' in navigator) {
+        navigator.vibrate(pattern);
+    }
+}
 
 function grab(e: MouseEvent | TouchEvent, bag: Bag, el: HTMLElement) {
     e.preventDefault();
+    vibrate(20); // Short haptic pulse on grab
+
     const pt = (e as TouchEvent).touches ? (e as TouchEvent).touches[0] : (e as MouseEvent);
     ghost.style.background = bag.color;
     ghost.textContent = bag.tag;
     ghost.style.display = 'flex';
     ghost.style.left = (pt.clientX - 28) + 'px';
     ghost.style.top = (pt.clientY - 26) + 'px';
+    ghost.style.transform = 'scale(1.1)'; // Scale up on grab
     el.style.opacity = '0.25';
-    drag = { bag, el };
+    el.style.transform = 'scale(0.9)'; // Scale down source
+
+    drag = {
+        bag,
+        el,
+        startX: pt.clientX,
+        startY: pt.clientY,
+        startTime: Date.now()
+    };
 
     document.addEventListener('mousemove', onMove as EventListener);
     document.addEventListener('mouseup', onDrop as EventListener);
@@ -174,7 +220,13 @@ function onMove(e: Event) {
         if (grid[r][c]) continue;
         const b = cells[i].getBoundingClientRect();
         const hit = pt.clientX > b.left && pt.clientX < b.right && pt.clientY > b.top && pt.clientY < b.bottom;
-        cells[i].classList.toggle('over', hit);
+
+        if (hit && !cells[i].classList.contains('over')) {
+            vibrate(10); // Subtle pulse when hovering over valid cell
+            cells[i].classList.add('over');
+        } else if (!hit && cells[i].classList.contains('over')) {
+            cells[i].classList.remove('over');
+        }
     }
 }
 
@@ -182,8 +234,17 @@ function onDrop(e: Event) {
     if (!drag) return;
     const ev = e as MouseEvent | TouchEvent;
     const pt = (ev as TouchEvent).changedTouches ? (ev as TouchEvent).changedTouches[0] : (ev as MouseEvent);
+
+    // Calculate drag velocity for swipe detection
+    const deltaX = pt.clientX - drag.startX;
+    const deltaY = pt.clientY - drag.startY;
+    const deltaTime = Date.now() - drag.startTime;
+    const velocity = Math.sqrt(deltaX * deltaX + deltaY * deltaY) / deltaTime;
+
     ghost.style.display = 'none';
+    ghost.style.transform = 'scale(1)';
     drag.el.style.opacity = '1';
+    drag.el.style.transform = 'scale(1)';
 
     let placed = false;
     const cells = document.querySelectorAll<HTMLElement>('.cell');
@@ -199,9 +260,22 @@ function onDrop(e: Event) {
             if (idx !== -1) { bags[idx].el?.remove(); bags.splice(idx, 1); }
             logEl.textContent = drag!.bag.tag + ' > ' + (r === 0 ? 'priority' : 'storage');
             placed = true;
+            vibrate([15, 10, 15]); // Success haptic pattern
+
+            // Animate cell fill
+            const filledCell = getCell(r, c);
+            if (filledCell) {
+                filledCell.style.animation = 'none';
+                setTimeout(() => {
+                    filledCell.style.animation = 'fillPulse 0.3s ease-out';
+                }, 10);
+            }
         }
     }
-    if (!placed) logEl.textContent = 'Drop on an empty cell.';
+    if (!placed) {
+        logEl.textContent = 'Drop on an empty cell.';
+        vibrate(50); // Error haptic - longer pulse
+    }
 
     document.removeEventListener('mousemove', onMove as EventListener);
     document.removeEventListener('mouseup', onDrop as EventListener);
